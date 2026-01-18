@@ -1,7 +1,8 @@
 /*
- * JS Cleaner Ultimate (C Language)
- * 内置简易语法分析引擎，完美区分 除法(/) 与 正则(/.../)
- * 修复：模板字符串、正则表达式、URL 被误删的问题
+ * JS Cleaner V7 (Smart Console Fix)
+ * 1. 修复：误删非调用式 console.log 后的右括号导致 Syntax Error
+ * 2. 修复：console.log 作为参数传递时，替换为 (()=>{}) 防止运行时错误
+ * 3. 保持：对正则 /.../ 和 模板字符串 `...` 的完美保护
  */
 
 #include <stdio.h>
@@ -20,33 +21,21 @@ typedef enum {
     STATE_COMMENT_BLOCK // /*...*/
 } State;
 
-// 辅助函数：判断前一个有效字符是否意味着接下来的是正则
-// 如果前一个符号是运算符、关键字或括号，那么 / 肯定是正则的开始
+// 判断 / 是否为正则开头
 int is_regex_start(const char *text, long idx) {
     long i = idx - 1;
-    // 1. 向前回溯，跳过空白字符
     while (i >= 0 && isspace(text[i])) i--;
-    if (i < 0) return 1; // 文件开头
-
+    if (i < 0) return 1;
     char last = text[i];
-    
-    // 2. 检查常见运算符和符号
     if (strchr("(=,:!&|?{};,", last)) return 1;
-    
-    // 3. 检查关键字 (如 return /.../, typeof /.../)
-    // 如果上一个字符是字母/数字/下划线，我们需要读出整个单词
-    if (isalnum(last) || last == '_' || last == '$') {
+    if (isalnum(last) || last == '_' || last == '$' || last == ')') {
         long end = i;
         while (i >= 0 && (isalnum(text[i]) || text[i] == '_' || text[i] == '$')) i--;
-        
-        // 提取单词
         long len = end - i;
         char word[32];
         if (len < 31) {
             strncpy(word, &text[i+1], len);
             word[len] = '\0';
-            
-            // 常见的后接正则的关键字
             if (strcmp(word, "return") == 0) return 1;
             if (strcmp(word, "case") == 0) return 1;
             if (strcmp(word, "throw") == 0) return 1;
@@ -56,32 +45,58 @@ int is_regex_start(const char *text, long idx) {
             if (strcmp(word, "await") == 0) return 1;
             if (strcmp(word, "yield") == 0) return 1;
         }
-        return 0; // 是变量名或数字，那后面的 / 就是除号
+        return 0;
     }
-    
-    // 4. 右括号 ] ) 后面通常是除号 (arr[i] / 2), 除非是 if (...) /regex/ 
-    // 这里做个简化假设，绝大多数情况 ] ) 后面是运算符。
-    // 如果您的代码中有 if(...) /regex/ 这种罕见写法可能需要更深层解析，但在 worker.js 中未见。
     return 0;
 }
 
-// 检查是否是 console.xxxx
-int is_console_call(const char *text, long i) {
-    if (strncmp(&text[i], "console.", 8) == 0) {
-        // 简单检查后面是否跟着 log/info/warn/error/debug
-        // 只需要确定是 console. 开头即可，后续逻辑会处理
-        return 1;
+// 检查 console 类型
+// 返回值: 
+// 0: 不是 console
+// 1: 是 console.log(...) 调用 -> 需要替换为 void(0) 并吞噬参数
+// 2: 是 console.log 引用 -> 需要替换为 (()=>{}) 并跳过
+// 3: 仅仅是 console 单词 -> 不处理
+int check_console_type(const char *text, long i, long size, long *method_len) {
+    if (strncmp(&text[i], "console.", 8) != 0) return 0;
+    
+    // 检查方法名
+    const char *methods[] = {"log", "warn", "error", "info", "debug", NULL};
+    int matched = 0;
+    long m_len = 0;
+    
+    for (int k = 0; methods[k]; k++) {
+        long len = strlen(methods[k]);
+        if (strncmp(&text[i + 8], methods[k], len) == 0) {
+            // 确保方法名后不是字母数字 (防止 console.logging)
+            char next = (i + 8 + len < size) ? text[i + 8 + len] : 0;
+            if (!isalnum(next) && next != '_') {
+                matched = 1;
+                m_len = 8 + len; // "console." + "log"
+                break;
+            }
+        }
     }
-    return 0;
+    
+    if (!matched) return 0;
+    
+    *method_len = m_len;
+    
+    // 向后查找，看看是不是调用 (跟着 '(' )
+    long j = i + m_len;
+    while (j < size && isspace(text[j])) j++;
+    
+    if (j < size && text[j] == '(') {
+        return 1; // 调用
+    } else {
+        return 2; // 引用 (作为参数或变量)
+    }
 }
 
 void process_file(const char *filename) {
     printf("Processing: %s ...\n", filename);
     
     FILE *f = fopen(filename, "rb");
-    if (!f) { printf("Error: File not found.\n"); return; }
-
-    // 读取全文件
+    if (!f) { printf("  [Error] File not found.\n"); return; }
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     rewind(f);
@@ -96,42 +111,39 @@ void process_file(const char *filename) {
     FILE *bak = fopen(bak_name, "wb");
     if (bak) { fwrite(input, 1, size, bak); fclose(bak); }
 
-    // 准备输出 buffer
-    // 因为要把 console.log(...) 替换为 void(0)，输出可能会变小，不会变大太多
-    char *output = (char*)malloc(size * 2 + 1); 
+    char *output = (char*)malloc(size * 2 + 1024); // 预留空间
     long out_idx = 0;
     
     State state = STATE_CODE;
     long i = 0;
     
-    // Console 移除专用变量
-    int skip_console = 0;
+    int skip_mode = 0; // 1 = 正在吞噬 console.log(...) 的参数
     int paren_depth = 0;
-    int in_console_str = 0; // 0=no, 1=', 2=", 3=`
+    int in_arg_str = 0; // 参数内的字符串状态
 
     while (i < size) {
         char c = input[i];
         char next = (i + 1 < size) ? input[i+1] : 0;
 
-        // --- 优先处理：正在移除 console 语句 ---
-        if (skip_console) {
-            // 必须识别括号内的字符串，防止字符串里的 ) 提前结束 console
-            if (in_console_str) {
-                if (c == '\\') { i++; } // 跳过转义
-                else if ((in_console_str == 1 && c == '\'') ||
-                         (in_console_str == 2 && c == '"') ||
-                         (in_console_str == 3 && c == '`')) {
-                    in_console_str = 0;
+        // --- 模式：吞噬 Console 参数 ---
+        if (skip_mode) {
+            // 必须识别参数里的字符串，以免误判括号
+            if (in_arg_str) {
+                if (c == '\\') { i++; } 
+                else if ((in_arg_str == 1 && c == '\'') ||
+                         (in_arg_str == 2 && c == '"') ||
+                         (in_arg_str == 3 && c == '`')) {
+                    in_arg_str = 0;
                 }
             } else {
-                if (c == '\'') in_console_str = 1;
-                else if (c == '"') in_console_str = 2;
-                else if (c == '`') in_console_str = 3;
+                if (c == '\'') in_arg_str = 1;
+                else if (c == '"') in_arg_str = 2;
+                else if (c == '`') in_arg_str = 3;
                 else if (c == '(') paren_depth++;
                 else if (c == ')') {
                     paren_depth--;
-                    if (paren_depth <= 0) {
-                        skip_console = 0; // Console 结束
+                    if (paren_depth == 0) {
+                        skip_mode = 0; // 吞噬结束
                     }
                 }
             }
@@ -139,36 +151,52 @@ void process_file(const char *filename) {
             continue;
         }
 
-        // --- 正常状态机 ---
+        // --- 正常状态 ---
         if (state == STATE_CODE) {
-            // 检查 Console
-            if (is_console_call(input, i)) {
-                skip_console = 1;
-                paren_depth = 0;
-                in_console_str = 0;
-                // 写入 void(0) 替代，保持语法
-                const char* replacement = "void(0)";
-                for(int k=0; replacement[k]; k++) output[out_idx++] = replacement[k];
-                // 跳过 console. 长度 (8)，循环末尾会 i++，所以逻辑要对齐
-                // is_console_call 只是检查开头，我们需要让 skip_console 逻辑去吞掉后面的字符
-                // 这里我们手动让 i 跳过 "console" 几个字，让下一轮循环进入 skip_console 逻辑处理点号后的内容
-                i += 7; 
+            long m_len = 0;
+            int c_type = check_console_type(input, i, size, &m_len);
+            
+            if (c_type == 1) { 
+                // Case 1: console.log(...) 调用 -> 替换为 void(0) 并吞噬
+                const char *rep = "void(0)";
+                for(int k=0; rep[k]; k++) output[out_idx++] = rep[k];
+                
+                // 跳过 "console.log"
+                i += m_len; 
+                
+                // 跳过空格直到 '('
+                while(i < size && isspace(input[i])) i++;
+                
+                // 此时 input[i] 应该是 '(', 开启吞噬模式
+                if (input[i] == '(') {
+                    skip_mode = 1;
+                    paren_depth = 1;
+                    i++; // 消耗掉 '('
+                }
+                continue;
+            } 
+            else if (c_type == 2) {
+                // Case 2: console.log 引用 -> 替换为 (()=>{})
+                // 这样作为参数传递给 createUnifiedConnection 时，是一个空函数，不会报错
+                const char *rep = "(()=>{})";
+                for(int k=0; rep[k]; k++) output[out_idx++] = rep[k];
+                i += m_len;
+                continue;
             }
-            else if (c == '\'') { state = STATE_STRING_SQ; output[out_idx++] = c; }
+            // else: 不是 console，继续处理
+
+            if (c == '\'') { state = STATE_STRING_SQ; output[out_idx++] = c; }
             else if (c == '"')  { state = STATE_STRING_DQ; output[out_idx++] = c; }
             else if (c == '`')  { state = STATE_STRING_TMP; output[out_idx++] = c; }
             else if (c == '/') {
                 if (next == '/') {
                     state = STATE_COMMENT_LINE;
-                    i++; // 跳过第二个 /
+                    i++; 
                 } else if (next == '*') {
                     state = STATE_COMMENT_BLOCK;
-                    i++; // 跳过 *
+                    i++; 
                 } else {
-                    // 核心逻辑：是正则还是除号？
-                    if (is_regex_start(input, i)) {
-                        state = STATE_REGEX;
-                    }
+                    if (is_regex_start(input, i)) state = STATE_REGEX;
                     output[out_idx++] = c;
                 }
             }
@@ -176,6 +204,7 @@ void process_file(const char *filename) {
                 output[out_idx++] = c;
             }
         }
+        // --- 字符串 / 正则 / 注释 状态处理 (保持不变) ---
         else if (state == STATE_STRING_SQ) {
             output[out_idx++] = c;
             if (c == '\\') { if(next) { output[out_idx++] = next; i++; } }
@@ -193,46 +222,36 @@ void process_file(const char *filename) {
         }
         else if (state == STATE_REGEX) {
             output[out_idx++] = c;
-            if (c == '\\') { if(next) { output[out_idx++] = next; i++; } } // 跳过转义字符，如 \/
+            if (c == '\\') { if(next) { output[out_idx++] = next; i++; } }
             else if (c == '/') state = STATE_CODE;
-            else if (c == '\n') state = STATE_CODE; // 防止正则没闭合导致吞噬后续代码
+            else if (c == '\n') state = STATE_CODE; 
         }
         else if (state == STATE_COMMENT_LINE) {
-            if (c == '\n') {
-                output[out_idx++] = c; // 保留换行
-                state = STATE_CODE;
-            }
+            if (c == '\n') { output[out_idx++] = c; state = STATE_CODE; }
         }
         else if (state == STATE_COMMENT_BLOCK) {
             if (c == '*' && next == '/') {
                 state = STATE_CODE;
-                output[out_idx++] = ' '; // 替换为空格
+                output[out_idx++] = ' ';
                 i++;
-            } else if (c == '\n') {
-                output[out_idx++] = c; // 保留换行
-            }
+            } else if (c == '\n') output[out_idx++] = c;
         }
-
         i++;
     }
 
-    // 写入文件
     FILE *out = fopen(filename, "wb");
     fwrite(output, 1, out_idx, out);
     fclose(out);
-
     free(input);
     free(output);
-    printf("Done. Saved to %s\n", filename);
+    printf("Done.\n");
 }
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        printf("Drag _worker.js here.\n");
-        // 方便调试：默认读取当前目录
         FILE *f = fopen("_worker.js", "rb");
         if(f) { fclose(f); process_file("_worker.js"); }
-        else getchar();
+        else { printf("Usage: Drag file here.\n"); getchar(); }
         return 0;
     }
     for(int i=1; i<argc; i++) process_file(argv[i]);
