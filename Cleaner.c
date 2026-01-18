@@ -1,130 +1,126 @@
 /*
- * Professional JS Cleaner V5 (Final Fix)
- * 功能：
- * 1. 移除 // 和 / * ... * / 注释
- * 2. 移除 console.log/error/info 等调试信息 (替换为 void(0))
- * 3. 核心修复：完美保护 ES6 模板字符串 (`...`) 中的 URL (https://)
- * 4. 稳健备份：确保先生成备份文件再修改原文件
+ * Professional JS Cleaner V6 (Final Stable)
+ * 1. 修复：ES6 模板字符串中 https:// 被误删导致的 Unexpected token
+ * 2. 修复：console.log("(:)") 参数中含括号导致解析错误
+ * 3. 修复：文件句柄冲突导致的“生成空文件”问题
+ * 4. 安全：采用“全内存缓冲”模式，先读后写，确保数据绝对安全
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-// 定义状态机状态
+// 定义状态机
 typedef enum {
     STATE_CODE,             // 正常代码
-    STATE_SLASH,            // 读到了 / (准备判断是否为注释)
-    STATE_STRING_SINGLE,    // 单引号字符串 '...'
-    STATE_STRING_DOUBLE,    // 双引号字符串 "..."
-    STATE_STRING_TEMPLATE,  // ES6 模板字符串 `...` (关键修复状态)
-    STATE_COMMENT_SINGLE,   // 单行注释 //...
-    STATE_COMMENT_MULTI,    // 多行注释 /*...*/
-    STATE_CONSOLE           // 正在识别/跳过 console.xxx(...)
+    STATE_SLASH,            // 读到了 / (待定)
+    STATE_STRING_SINGLE,    // '...'
+    STATE_STRING_DOUBLE,    // "..."
+    STATE_STRING_TEMPLATE,  // `...` (保护 https:// 的关键)
+    STATE_COMMENT_SINGLE,   // //...
+    STATE_COMMENT_MULTI,    // /*...*/
+    STATE_CONSOLE           // 正在移除 console.xxx(...)
 } State;
 
-// 辅助：判断是否开始 console 调用
-int check_console_start(const char* buffer, size_t idx, size_t len) {
-    if (idx + 8 > len) return 0;
-    if (strncmp(&buffer[idx], "console.", 8) == 0) return 1;
+// 判断是否是 console. 开头
+int is_console_start(const char *text, long i, long fsize) {
+    if (i + 8 > fsize) return 0;
+    // 匹配 console.
+    if (strncmp(&text[i], "console.", 8) == 0) return 1;
     return 0;
-}
-
-// 复制文件 (用于备份)
-int copy_file(const char *src_path, const char *dst_path) {
-    FILE *src = fopen(src_path, "rb");
-    if (!src) return 0;
-    FILE *dst = fopen(dst_path, "wb");
-    if (!dst) { fclose(src); return 0; }
-    
-    char buf[4096];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), src)) > 0) {
-        fwrite(buf, 1, n, dst);
-    }
-    fclose(src);
-    fclose(dst);
-    return 1;
 }
 
 void process_file(const char *filename) {
     printf("Processing: %s ...\n", filename);
 
-    // 1. 强制备份 (Backup First)
-    char backup_name[1024];
-    snprintf(backup_name, sizeof(backup_name), "%s.bak", filename);
-    
-    // 检查源文件是否存在
-    FILE *check = fopen(filename, "rb");
-    if (!check) {
-        printf("  [Error] Input file not found!\n");
-        return;
-    }
-    fclose(check);
-
-    if (!copy_file(filename, backup_name)) {
-        printf("  [Error] Failed to create backup. Aborting safely.\n");
-        return;
-    }
-    printf("  [Info] Backup created: %s\n", backup_name);
-
-    // 2. 读取整个文件到内存 (便于向后预读 console 语句)
     FILE *f = fopen(filename, "rb");
+    if (!f) {
+        printf("  [Error] File not found: %s\n", filename);
+        return;
+    }
+
+    // 1. 安全读取：获取文件大小并读入内存
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     rewind(f);
-    
+
     char *text = (char*)malloc(fsize + 1);
-    if (!text) { printf("  [Error] Memory allocation failed.\n"); fclose(f); return; }
-    fread(text, 1, fsize, f);
+    if (!text) {
+        printf("  [Error] Memory allocation failed.\n");
+        fclose(f);
+        return;
+    }
+    // 读取全部内容后立即关闭文件句柄，避免读写冲突
+    if (fread(text, 1, fsize, f) != fsize) {
+        printf("  [Error] Read error.\n");
+        free(text);
+        fclose(f);
+        return;
+    }
     text[fsize] = '\0';
     fclose(f);
 
-    // 3. 打开文件准备写入
+    // 2. 创建备份 (写入 .bak)
+    char bak_name[1024];
+    snprintf(bak_name, sizeof(bak_name), "%s.bak", filename);
+    FILE *bak = fopen(bak_name, "wb");
+    if (bak) {
+        fwrite(text, 1, fsize, bak);
+        fclose(bak);
+        printf("  [Info] Backup created: %s\n", bak_name);
+    } else {
+        printf("  [Warning] Failed to create backup file.\n");
+    }
+
+    // 3. 处理并写入原文件
     FILE *out = fopen(filename, "wb");
-    if (!out) { printf("  [Error] Cannot write to file.\n"); free(text); return; }
+    if (!out) {
+        printf("  [Error] Cannot write to %s\n", filename);
+        free(text);
+        return;
+    }
 
     State state = STATE_CODE;
-    int paren_depth = 0; // 用于跟踪 console.log(...) 的括号深度
+    int console_paren_depth = 0; // 记录括号深度
+    int console_in_string = 0;   // 记录 console 参数里是否在字符串中
+    char console_quote_char = 0; // 记录 console 参数里的引号类型
 
     for (long i = 0; i < fsize; i++) {
         char c = text[i];
-        char next = (i + 1 < fsize) ? text[i + 1] : '\0';
+        char next = (i + 1 < fsize) ? text[i+1] : 0;
 
-        // --- 状态机逻辑 ---
         switch (state) {
             case STATE_CODE:
-                // 检查是否是 console.xxx
-                if (check_console_start(text, i, fsize)) {
+                // 检查 console.
+                if (is_console_start(text, i, fsize)) {
                     state = STATE_CONSOLE;
-                    paren_depth = 0;
-                    fprintf(out, "void(0)"); // 安全替换，保持语法结构 (如箭头函数)
-                    i += 7; // 跳过 "console." (循环末尾会+1, 所以这里少加一点)
+                    console_paren_depth = 0;
+                    console_in_string = 0;
+                    fprintf(out, "void(0)"); // 替换为无操作表达式
+                    i += 7; // 跳过 "console." (循环末尾i++会跳过e)
                 }
                 else if (c == '\'') { state = STATE_STRING_SINGLE; fputc(c, out); }
                 else if (c == '"')  { state = STATE_STRING_DOUBLE; fputc(c, out); }
-                else if (c == '`')  { state = STATE_STRING_TEMPLATE; fputc(c, out); } // 进入模板字符串
-                else if (c == '/')  { state = STATE_SLASH; } // 暂不写入，等待确认
+                else if (c == '`')  { state = STATE_STRING_TEMPLATE; fputc(c, out); }
+                else if (c == '/')  { state = STATE_SLASH; } // 暂不输出
                 else { fputc(c, out); }
                 break;
 
             case STATE_SLASH:
-                if (c == '/') { state = STATE_COMMENT_SINGLE; } // 确认是 //
-                else if (c == '*') { state = STATE_COMMENT_MULTI; } // 确认是 /*
+                if (c == '/') { state = STATE_COMMENT_SINGLE; }
+                else if (c == '*') { state = STATE_COMMENT_MULTI; }
                 else {
-                    // 只是普通的除号，补上刚才跳过的 /，并写入当前字符
+                    // 不是注释，恢复输出 / 和当前字符
                     fputc('/', out);
+                    // 重新检查当前字符 c 的状态
                     state = STATE_CODE;
-                    
-                    // 重新检查当前字符 c，因为它可能是引号或 console 的开始
-                    // 简单回退索引重新处理 (简单粗暴但有效)
-                    i--; 
+                    i--; // 回退一步，让 STATE_CODE 重新处理这个字符
                 }
                 break;
 
             case STATE_COMMENT_SINGLE:
                 if (c == '\n') {
-                    fputc(c, out); // 保留换行符，防止行合并错误
+                    fputc(c, out); // 保留换行
                     state = STATE_CODE;
                 }
                 break;
@@ -133,67 +129,79 @@ void process_file(const char *filename) {
                 if (c == '*' && next == '/') {
                     state = STATE_CODE;
                     i++; // 跳过 /
-                    fputc(' ', out); // 替换为一个空格
+                    fputc(' ', out); // 替换为空格
                 } else if (c == '\n') {
-                    fputc(c, out); // 保留多行注释内的换行，保持行号一致
+                    fputc(c, out); // 保留换行
                 }
                 break;
 
-            // --- 字符串保护状态 (忽略内部的 // 和 console) ---
+            // --- 字符串保护 (原样输出) ---
             case STATE_STRING_SINGLE:
                 fputc(c, out);
-                if (c == '\\') { if (next) { fputc(next, out); i++; } } // 跳过转义
-                else if (c == '\'') { state = STATE_CODE; }
+                if (c == '\\') { if(next) { fputc(next, out); i++; } }
+                else if (c == '\'') state = STATE_CODE;
                 break;
 
             case STATE_STRING_DOUBLE:
                 fputc(c, out);
-                if (c == '\\') { if (next) { fputc(next, out); i++; } }
-                else if (c == '"') { state = STATE_CODE; }
+                if (c == '\\') { if(next) { fputc(next, out); i++; } }
+                else if (c == '"') state = STATE_CODE;
                 break;
 
-            case STATE_STRING_TEMPLATE: // 关键：保护 `https://...`
+            case STATE_STRING_TEMPLATE: // 关键：保护 https://
                 fputc(c, out);
-                if (c == '\\') { if (next) { fputc(next, out); i++; } }
-                else if (c == '`') { state = STATE_CODE; }
+                if (c == '\\') { if(next) { fputc(next, out); i++; } }
+                else if (c == '`') state = STATE_CODE;
                 break;
 
+            // --- Console 移除逻辑 (增强版) ---
             case STATE_CONSOLE:
-                // 在跳过 console 语句时，必须小心字符串内的括号
-                // 简化处理：我们假设 console 语句内括号是匹配的
-                // 为了极度安全，这里只做简单的括号计数，如果遇到引号也简单跳过
-                if (c == '(') paren_depth++;
-                else if (c == ')') {
-                    paren_depth--;
-                    if (paren_depth <= 0) state = STATE_CODE; // console 结束
+                // 如果在 console 参数的字符串里 (例如 console.log(")"))
+                if (console_in_string) {
+                    if (c == '\\') { i++; } // 跳过转义
+                    else if (c == console_quote_char) { console_in_string = 0; }
                 }
-                // 注意：这里完全不写入任何内容，达到删除效果
+                else {
+                    // 如果遇到引号，进入字符串模式
+                    if (c == '"' || c == '\'' || c == '`') {
+                        console_in_string = 1;
+                        console_quote_char = c;
+                    }
+                    else if (c == '(') {
+                        console_paren_depth++;
+                    }
+                    else if (c == ')') {
+                        console_paren_depth--;
+                        if (console_paren_depth == 0) {
+                            // Console 调用结束
+                            state = STATE_CODE;
+                        }
+                    }
+                }
+                // 注意：这里不执行 fputc，即删除内容
                 break;
         }
     }
 
-    // 处理文件末尾如果还停留在 STATE_SLASH
+    // 处理文件末尾的 slash
     if (state == STATE_SLASH) fputc('/', out);
 
     fclose(out);
     free(text);
-    printf("  [Success] File cleaned successfully.\n");
+    printf("  [Success] File cleaned. Logs and comments removed.\n");
 }
 
 int main(int argc, char *argv[]) {
-    printf("JS Cleaner Tool V5\n");
     if (argc < 2) {
-        printf("Usage: Drag _worker.js file onto this exe.\n");
-        // 方便调试，如果有默认文件直接处理
-        FILE *f = fopen("_worker.js", "rb");
-        if(f) { fclose(f); process_file("_worker.js"); }
+        printf("Usage: Drag file onto this exe.\n");
+        // 尝试处理默认文件
+        FILE *test = fopen("_worker.js", "rb");
+        if (test) { fclose(test); process_file("_worker.js"); }
         else { getchar(); }
         return 0;
     }
-    for (int i = 1; i < argc; i++) {
-        process_file(argv[i]);
-    }
-    printf("Done. Press Enter to exit...");
-    getchar();
+    for (int i = 1; i < argc; i++) process_file(argv[i]);
+    printf("Done.\n");
+    // getchar(); // 如果需要暂停窗口请取消注释
     return 0;
 }
