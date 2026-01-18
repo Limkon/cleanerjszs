@@ -1,0 +1,47 @@
+name: Build Cleaner Tool
+
+# 触发条件：当推送到 main 分支，或手动点击触发
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'cleaner.c' # 只有 cleaner.c 变动时才触发，节省资源
+      - '.github/workflows/**'
+  workflow_dispatch: # 允许在 Actions 页面手动点击 Run workflow 按钮
+
+jobs:
+  build-windows:
+    name: Build for Windows
+    runs-on: windows-latest # 使用 GitHub 提供的最新 Windows 环境
+
+    steps:
+    # 第一步：检出代码
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # 第二步：编译 C 代码 (GitHub Windows 环境预装了 GCC/MinGW)
+    - name: Compile C Source
+      run: |
+        echo "Compiling cleaner.c..."
+        gcc cleaner.c -o cleaner.exe -O2 -s
+        echo "Compilation successful!"
+      # -O2: 优化代码运行速度
+      # -s:  剥离符号表，减小 exe 体积
+
+    # 第三步：验证文件是否生成
+    - name: Verify Output
+      run: |
+        if (Test-Path cleaner.exe) {
+            Write-Host "cleaner.exe created successfully."
+        } else {
+            Write-Error "cleaner.exe not found!"
+            exit 1
+        }
+
+    # 第四步：上传编译好的 exe 文件供下载
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: cleaner-windows  # 下载时的压缩包名称
+        path: cleaner.exe      # 要打包的文件
+        retention-days: 5      # 文件保留 5 天
