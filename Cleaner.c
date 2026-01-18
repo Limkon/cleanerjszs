@@ -1,8 +1,8 @@
 /*
- * JS Cleaner V7 (Smart Console Fix)
- * 1. 修复：误删非调用式 console.log 后的右括号导致 Syntax Error
- * 2. 修复：console.log 作为参数传递时，替换为 (()=>{}) 防止运行时错误
- * 3. 保持：对正则 /.../ 和 模板字符串 `...` 的完美保护
+ * JS Cleaner V8 (Final Polish)
+ * 1. 新增：自动识别并彻底删除“整行注释”，不留空行
+ * 2. 保持：V7 的所有安全特性 (修复 Unexpected token, 保护 https://, 智能处理 console)
+ * 3. 细节：自动清理注释前的缩进空格
  */
 
 #include <stdio.h>
@@ -21,7 +21,7 @@ typedef enum {
     STATE_COMMENT_BLOCK // /*...*/
 } State;
 
-// 判断 / 是否为正则开头
+// 判断 / 是否为正则开头 (同V7)
 int is_regex_start(const char *text, long idx) {
     long i = idx - 1;
     while (i >= 0 && isspace(text[i])) i--;
@@ -50,46 +50,29 @@ int is_regex_start(const char *text, long idx) {
     return 0;
 }
 
-// 检查 console 类型
-// 返回值: 
-// 0: 不是 console
-// 1: 是 console.log(...) 调用 -> 需要替换为 void(0) 并吞噬参数
-// 2: 是 console.log 引用 -> 需要替换为 (()=>{}) 并跳过
-// 3: 仅仅是 console 单词 -> 不处理
+// 检查 console 类型 (同V7)
 int check_console_type(const char *text, long i, long size, long *method_len) {
     if (strncmp(&text[i], "console.", 8) != 0) return 0;
-    
-    // 检查方法名
     const char *methods[] = {"log", "warn", "error", "info", "debug", NULL};
     int matched = 0;
     long m_len = 0;
-    
     for (int k = 0; methods[k]; k++) {
         long len = strlen(methods[k]);
         if (strncmp(&text[i + 8], methods[k], len) == 0) {
-            // 确保方法名后不是字母数字 (防止 console.logging)
             char next = (i + 8 + len < size) ? text[i + 8 + len] : 0;
             if (!isalnum(next) && next != '_') {
                 matched = 1;
-                m_len = 8 + len; // "console." + "log"
+                m_len = 8 + len;
                 break;
             }
         }
     }
-    
     if (!matched) return 0;
-    
     *method_len = m_len;
-    
-    // 向后查找，看看是不是调用 (跟着 '(' )
     long j = i + m_len;
     while (j < size && isspace(text[j])) j++;
-    
-    if (j < size && text[j] == '(') {
-        return 1; // 调用
-    } else {
-        return 2; // 引用 (作为参数或变量)
-    }
+    if (j < size && text[j] == '(') return 1; 
+    else return 2;
 }
 
 void process_file(const char *filename) {
@@ -111,23 +94,25 @@ void process_file(const char *filename) {
     FILE *bak = fopen(bak_name, "wb");
     if (bak) { fwrite(input, 1, size, bak); fclose(bak); }
 
-    char *output = (char*)malloc(size * 2 + 1024); // 预留空间
+    char *output = (char*)malloc(size * 2 + 1024);
     long out_idx = 0;
     
     State state = STATE_CODE;
     long i = 0;
     
-    int skip_mode = 0; // 1 = 正在吞噬 console.log(...) 的参数
+    int skip_mode = 0; 
     int paren_depth = 0;
-    int in_arg_str = 0; // 参数内的字符串状态
+    int in_arg_str = 0; 
+    
+    // 新增：标记当前是否为整行注释
+    int is_whole_line_comment = 0;
 
     while (i < size) {
         char c = input[i];
         char next = (i + 1 < size) ? input[i+1] : 0;
 
-        // --- 模式：吞噬 Console 参数 ---
+        // --- Console 参数吞噬模式 ---
         if (skip_mode) {
-            // 必须识别参数里的字符串，以免误判括号
             if (in_arg_str) {
                 if (c == '\\') { i++; } 
                 else if ((in_arg_str == 1 && c == '\'') ||
@@ -142,54 +127,64 @@ void process_file(const char *filename) {
                 else if (c == '(') paren_depth++;
                 else if (c == ')') {
                     paren_depth--;
-                    if (paren_depth == 0) {
-                        skip_mode = 0; // 吞噬结束
-                    }
+                    if (paren_depth == 0) skip_mode = 0;
                 }
             }
             i++;
             continue;
         }
 
-        // --- 正常状态 ---
+        // --- 正常模式 ---
         if (state == STATE_CODE) {
             long m_len = 0;
             int c_type = check_console_type(input, i, size, &m_len);
             
-            if (c_type == 1) { 
-                // Case 1: console.log(...) 调用 -> 替换为 void(0) 并吞噬
+            if (c_type == 1) { // console.log(...) 调用
                 const char *rep = "void(0)";
                 for(int k=0; rep[k]; k++) output[out_idx++] = rep[k];
-                
-                // 跳过 "console.log"
                 i += m_len; 
-                
-                // 跳过空格直到 '('
                 while(i < size && isspace(input[i])) i++;
-                
-                // 此时 input[i] 应该是 '(', 开启吞噬模式
                 if (input[i] == '(') {
                     skip_mode = 1;
                     paren_depth = 1;
-                    i++; // 消耗掉 '('
+                    i++; 
                 }
                 continue;
             } 
-            else if (c_type == 2) {
-                // Case 2: console.log 引用 -> 替换为 (()=>{})
-                // 这样作为参数传递给 createUnifiedConnection 时，是一个空函数，不会报错
+            else if (c_type == 2) { // console.log 引用
                 const char *rep = "(()=>{})";
                 for(int k=0; rep[k]; k++) output[out_idx++] = rep[k];
                 i += m_len;
                 continue;
             }
-            // else: 不是 console，继续处理
 
             if (c == '\'') { state = STATE_STRING_SQ; output[out_idx++] = c; }
             else if (c == '"')  { state = STATE_STRING_DQ; output[out_idx++] = c; }
             else if (c == '`')  { state = STATE_STRING_TMP; output[out_idx++] = c; }
             else if (c == '/') {
                 if (next == '/') {
+                    // --- 核心改进：检测是否为整行注释 ---
+                    // 回溯检查 output 缓冲区，看这一行前面是否全是空白
+                    long temp_idx = out_idx;
+                    int only_spaces = 1;
+                    while (temp_idx > 0) {
+                        char prev = output[temp_idx - 1];
+                        if (prev == '\n' || prev == '\r') break; // 到了上一行末尾
+                        if (prev != ' ' && prev != '\t') {
+                            only_spaces = 0;
+                            break;
+                        }
+                        temp_idx--;
+                    }
+                    
+                    if (only_spaces) {
+                        // 是整行注释！
+                        out_idx = temp_idx; // 撤销之前写入的空格（回退指针）
+                        is_whole_line_comment = 1; // 标记
+                    } else {
+                        is_whole_line_comment = 0;
+                    }
+
                     state = STATE_COMMENT_LINE;
                     i++; 
                 } else if (next == '*') {
@@ -204,7 +199,7 @@ void process_file(const char *filename) {
                 output[out_idx++] = c;
             }
         }
-        // --- 字符串 / 正则 / 注释 状态处理 (保持不变) ---
+        // --- 字符串 / 正则 ---
         else if (state == STATE_STRING_SQ) {
             output[out_idx++] = c;
             if (c == '\\') { if(next) { output[out_idx++] = next; i++; } }
@@ -224,17 +219,27 @@ void process_file(const char *filename) {
             output[out_idx++] = c;
             if (c == '\\') { if(next) { output[out_idx++] = next; i++; } }
             else if (c == '/') state = STATE_CODE;
-            else if (c == '\n') state = STATE_CODE; 
+            else if (c == '\n') state = STATE_CODE;
         }
+        // --- 注释处理 (带空行清理) ---
         else if (state == STATE_COMMENT_LINE) {
-            if (c == '\n') { output[out_idx++] = c; state = STATE_CODE; }
+            if (c == '\n') {
+                if (!is_whole_line_comment) {
+                    output[out_idx++] = c; // 如果是行尾注释，保留换行
+                }
+                // 如果是整行注释，c (\n) 不会被写入，相当于整行被删
+                state = STATE_CODE;
+                is_whole_line_comment = 0; // 重置
+            }
         }
         else if (state == STATE_COMMENT_BLOCK) {
             if (c == '*' && next == '/') {
                 state = STATE_CODE;
                 output[out_idx++] = ' ';
                 i++;
-            } else if (c == '\n') output[out_idx++] = c;
+            } else if (c == '\n') {
+                output[out_idx++] = c;
+            }
         }
         i++;
     }
